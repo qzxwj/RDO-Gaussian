@@ -9,8 +9,16 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import csv
+import json
 import os
 import torch
+
+_CPU_THREADS = max(1, int(os.environ.get("RDO_CPU_THREADS", "4")))
+for _env_key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_key, str(_CPU_THREADS))
+torch.set_num_threads(_CPU_THREADS)
+
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
@@ -29,6 +37,31 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+CURVES_FIELDS = [
+    "iter", "n_gaussians", "n_active",
+    "l1_loss", "ssim_loss", "mse_loss", "render_loss", "train_psnr",
+    "vq_loss", "rate_loss",
+    "sh_mask_loss", "gs_mask_loss",
+    "sh_mask_term", "gs_mask_term",
+    "total_loss",
+]
+CURVES_TEST_FIELDS = ["iter", "test_l1", "test_psnr"]
+
+
+def _as_float(x):
+    if torch.is_tensor(x):
+        return float(x.detach().item())
+    return float(x)
+
+
+def _append_csv(path, fieldnames, row):
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -57,8 +90,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
 
+    resolved_freeze_iter = int(getattr(opt, "freeze_masks_iter", -1))
+    if resolved_freeze_iter <= 0 and opt.freeze_masks_at_vq:
+        resolved_freeze_iter = int(opt.vq_start_iter)
+
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        if opt.geo_canonicalize and iteration > opt.densify_until_iter:
+            if iteration == opt.vq_start_iter or (iteration % opt.geo_canon_interval == 0):
+                canon_stats = gaussians.apply_geo_canonicalize(opt.geo_canon_aniso_ratio)
+                print(
+                    f"\n[ITER {iteration}] geo_canonicalize "
+                    f"axis_perm={canon_stats['frac_axis_perm']:.4f} "
+                    f"hemisphere={canon_stats['frac_hemisphere']:.4f} "
+                    f"skipped_iso={canon_stats['frac_skipped_iso']:.4f}"
+                )
+        if iteration == resolved_freeze_iter and not gaussians.masks_frozen:
+            gaussians.freeze_prune_masks()
+            print(f"\n[ITER {iteration}] freeze gs/sh masks")
         if iteration == opt.vq_start_iter:
             # kmeans initialization
             for key in vq_cfg["keys"]:
@@ -92,7 +141,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             activate_gsprune=activate_gsprune,
             activate_vq = activate_vq,
             vq_cfg=vq_cfg,
-            update_index=(iteration-1) % 10 == 0
+            update_index=((iteration - 1) % 10 == 0)
         )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         rate_loss = render_pkg["rate_loss"]
@@ -106,8 +155,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        render_loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))
-        loss = render_loss + vq_loss + rate_loss + opt.sh_mask_lambda * sh_mask_loss + opt.gs_mask_lambda * gs_mask_loss
+        ssim_loss = 1.0 - ssim(image, gt_image)
+        mse_loss = torch.mean((image - gt_image) ** 2)
+        psnr_finetune = (
+            opt.psnr_finetune_from_iter > 0
+            and iteration >= opt.psnr_finetune_from_iter
+        )
+        if psnr_finetune:
+            mode = str(opt.psnr_finetune_mode).lower()
+            if mode == "mse":
+                render_loss = opt.psnr_finetune_scale * mse_loss
+            elif mode == "log_mse":
+                render_loss = opt.psnr_finetune_scale * torch.log(
+                    mse_loss.clamp_min(1e-8)
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported psnr_finetune_mode: {opt.psnr_finetune_mode}"
+                )
+            if iteration == opt.psnr_finetune_from_iter:
+                print(
+                    f"\n[ITER {iteration}] PSNR fine-tune mode={mode} "
+                    f"scale={opt.psnr_finetune_scale:g}"
+                )
+        else:
+            render_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
+        sh_mask_term = opt.sh_mask_lambda * sh_mask_loss
+        gs_mask_term = opt.gs_mask_lambda * gs_mask_loss
+        loss = render_loss + vq_loss + rate_loss + sh_mask_term + gs_mask_term
         loss.backward()
 
         iter_end.record()
@@ -130,13 +205,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer_vq.step()
                     gaussians.scheduler_vq.step()
                 gaussians.optimizer_vq.zero_grad(set_to_none = True)
-                if activate_shprune:
+                if activate_shprune and not gaussians.masks_frozen:
                     gaussians.optimizer_sh_mask.step()
                 gaussians.optimizer_sh_mask.zero_grad(set_to_none = True)
-                if activate_gsprune:
+                if activate_gsprune and not gaussians.masks_frozen:
                     gaussians.optimizer_gs_mask.step()
                 gaussians.optimizer_gs_mask.zero_grad(set_to_none = True)
                                     
+            if iteration % 10 == 0:
+                n_gaussians = int(gaussians._xyz.shape[0])
+                if activate_gsprune:
+                    n_active = int((torch.sigmoid(gaussians.gs_mask).flatten() > gaussians.gs_mask_thres).sum().item())
+                else:
+                    n_active = n_gaussians
+                _append_csv(
+                    os.path.join(scene.model_path, "curves.csv"),
+                    CURVES_FIELDS,
+                    {
+                        "iter": iteration,
+                        "n_gaussians": n_gaussians,
+                        "n_active": n_active,
+                        "l1_loss": f"{_as_float(Ll1):.8f}",
+                        "ssim_loss": f"{_as_float(ssim_loss):.8f}",
+                        "mse_loss": f"{_as_float(mse_loss):.8f}",
+                        "render_loss": f"{_as_float(render_loss):.8f}",
+                        "train_psnr": f"{psnr(image, gt_image).mean().item():.8f}",
+                        "vq_loss": f"{_as_float(vq_loss):.8f}",
+                        "rate_loss": f"{_as_float(rate_loss):.8f}",
+                        "sh_mask_loss": f"{_as_float(sh_mask_loss):.8f}",
+                        "gs_mask_loss": f"{_as_float(gs_mask_loss):.8f}",
+                        "sh_mask_term": f"{_as_float(sh_mask_term):.8f}",
+                        "gs_mask_term": f"{_as_float(gs_mask_term):.8f}",
+                        "total_loss": f"{_as_float(loss):.8f}",
+                    },
+                )
+
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
                             vq_cfg=vq_cfg, activate_vq=activate_vq, activate_shprune=activate_shprune, activate_gsprune=activate_gsprune)
@@ -189,7 +292,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        absgs=getattr(opt, "absgs", False),
+                    )
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -257,6 +366,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                if config['name'] == 'test':
+                    _append_csv(
+                        os.path.join(scene.model_path, "curves_test.csv"),
+                        CURVES_TEST_FIELDS,
+                        {
+                            "iter": iteration,
+                            "test_l1": f"{float(l1_test):.8f}",
+                            "test_psnr": f"{float(psnr_test):.8f}",
+                        },
+                    )
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -272,7 +391,7 @@ if __name__ == "__main__":
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=list(range(1000, 30_001, 1000)))
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

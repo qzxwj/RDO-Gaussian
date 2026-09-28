@@ -1,6 +1,8 @@
 from argparse import ArgumentParser
+import io
 import os
 import struct
+import zipfile
 import numpy as np
 import torch
 from utils.entropy_model import DiscreteUnconditionalEntropyModel, Softmax
@@ -80,6 +82,103 @@ def shmask_sort(sh_bitmask:dict):
         boundaries = np.append(boundaries, num_gaussians)
                     
     return sort_idx, boundaries
+
+
+def _part1by2_10bit(x):
+    """Expand 10 bits so three coordinates can be interleaved."""
+    x = x.astype(np.uint32, copy=False) & np.uint32(0x3FF)
+    x = (x | (x << np.uint32(16))) & np.uint32(0x030000FF)
+    x = (x | (x << np.uint32(8))) & np.uint32(0x0300F00F)
+    x = (x | (x << np.uint32(4))) & np.uint32(0x030C30C3)
+    x = (x | (x << np.uint32(2))) & np.uint32(0x09249249)
+    return x
+
+
+def spatial_sort_within_boundaries(xyz, sort_idx, boundaries):
+    """Morton-sort each SH-mask group without changing group boundaries."""
+    xyz32 = np.asarray(xyz, dtype=np.float32)
+    xyz_min = xyz32.min(axis=0)
+    xyz_max = xyz32.max(axis=0)
+    quant = np.clip(
+        np.rint((xyz32 - xyz_min) / (xyz_max - xyz_min + 1e-12) * 1023.0),
+        0,
+        1023,
+    ).astype(np.uint32)
+    morton = (
+        _part1by2_10bit(quant[:, 0])
+        | (_part1by2_10bit(quant[:, 1]) << np.uint32(1))
+        | (_part1by2_10bit(quant[:, 2]) << np.uint32(2))
+    )
+
+    sorted_idx = np.asarray(sort_idx)
+    local_order = []
+    start = 0
+    for end in boundaries:
+        end = int(end)
+        segment = np.arange(start, end)
+        original_idx = sorted_idx[segment]
+        local_order.append(segment[np.argsort(morton[original_idx], kind="stable")])
+        start = end
+    if not local_order:
+        return sorted_idx
+    return sorted_idx[np.concatenate(local_order)]
+
+
+def save_positions_lossless(path, xyz):
+    """Losslessly delta-code spatially sorted float16 positions."""
+    xyz16 = np.ascontiguousarray(xyz, dtype=np.float16)
+    bits = xyz16.view(np.uint16)
+    ordered = np.where(
+        (bits & np.uint16(0x8000)) != 0,
+        np.bitwise_not(bits),
+        bits ^ np.uint16(0x8000),
+    ).astype(np.uint16)
+    delta = np.empty_like(ordered)
+    delta[0] = ordered[0]
+    delta[1:] = (
+        ordered[1:].astype(np.uint32) - ordered[:-1].astype(np.uint32)
+    ).astype(np.uint16)
+    # Coordinate-major layout gives the compressor longer homogeneous runs.
+    # The LZMA-backed NPZ remains directly readable by numpy.load.
+    save_npz_lzma(
+        path,
+        position_delta_flat_f=delta.reshape(-1, order="F"),
+    )
+
+
+def save_npz_lzma(path, **arrays):
+    """Write a numpy-compatible NPZ using ZIP-LZMA compression."""
+    with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_LZMA) as archive:
+        for key, value in arrays.items():
+            buffer = io.BytesIO()
+            np.lib.format.write_array(
+                buffer,
+                np.asanyarray(value),
+                allow_pickle=False,
+            )
+            archive.writestr(f"{key}.npy", buffer.getvalue())
+
+
+def load_positions(path):
+    """Load the new lossless position stream or a legacy position array."""
+    payload = np.load(path)
+    if "position" in payload.files:
+        return payload["position"]
+    if "position_delta_flat_f" in payload.files:
+        flat = payload["position_delta_flat_f"]
+        if flat.size % 3 != 0:
+            raise ValueError(f"Invalid position delta length in {path}: {flat.size}")
+        delta = flat.reshape((-1, 3), order="F")
+    else:
+        delta = payload["position_delta"]
+    delta = delta.astype(np.uint64)
+    ordered = (np.cumsum(delta, axis=0) & np.uint64(0xFFFF)).astype(np.uint16)
+    bits = np.where(
+        (ordered & np.uint16(0x8000)) != 0,
+        ordered ^ np.uint16(0x8000),
+        np.bitwise_not(ordered),
+    ).astype(np.uint16)
+    return np.ascontiguousarray(bits).view(np.float16)
 
 def entropy_coding(attr_index, attr_logits, range_coder_precision=16):
     em = DiscreteUnconditionalEntropyModel(Softmax(attr_logits), range_coder_precision)

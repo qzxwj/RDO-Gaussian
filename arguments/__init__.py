@@ -25,17 +25,24 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
-            if shorthand:
+            fill_value = value if not fill_none else None
+            if t == bool and value is True and not fill_none:
+                flags = ["--" + key]
+                if shorthand:
+                    flags.append("-" + key[0:1])
+                group.add_argument(*flags, action="store_true")
+                group.add_argument("--no_" + key, dest=key, action="store_false")
+                group.set_defaults(**{key: True})
+            elif shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=fill_value, action="store_true")
                 else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=fill_value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument("--" + key, default=fill_value, action="store_true")
                 else:
-                    group.add_argument("--" + key, default=value, type=t)
+                    group.add_argument("--" + key, default=fill_value, type=t)
 
     def extract(self, args):
         group = GroupParams()
@@ -81,6 +88,13 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        # Optional late-stage distortion objective.  A positive start
+        # iteration replaces L1+DSSIM with either scaled MSE or scaled
+        # log-MSE, which directly targets PSNR while leaving the earlier
+        # geometry/mask learning schedule unchanged.
+        self.psnr_finetune_from_iter = -1
+        self.psnr_finetune_mode = "mse"
+        self.psnr_finetune_scale = 20.0
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
@@ -90,18 +104,18 @@ class OptimizationParams(ParamGroup):
         # Gaussain prune cfgs
         self.gs_prune_start_iter = 15_001
         self.gs_mask_lr = 0.01
-        self.gs_mask_lambda = 0.0005
+        self.gs_mask_lambda = 0.005
         # Adaptive SHs prune cfgs
         self.sh_prune_start_iter = 15_001
         self.sh_mask_lr = 0.05
-        self.sh_mask_lambda = 0.005
+        self.sh_mask_lambda = 0.05
         # VQ cfgs
-        self.vq_start_iter = 15_001
-        self.rate_constrain_iter = 20_001
+        self.vq_start_iter = 20_001
+        self.rate_constrain_iter = 25_001
         self.reactivate_codeword_period = 1000
         self.vq_cb_lr = 0.0002
         self.vq_logits_lr = 0.002
-        self.vq_scale_lmbda = 32768
+        self.vq_scale_lmbda = 4096
         self.vq_rot_lmbda = 256
         self.vq_dc_lmbda = 256
         self.vq_sh1_lmbda = 256
@@ -114,6 +128,18 @@ class OptimizationParams(ParamGroup):
         self.vq_sh2_cbsize = 4096
         self.vq_sh3_cbsize = 4096
         self.vq_patch_size = 16384
+        # Defaults match change-rdo. Original RDO-Gaussian: --no_absgs
+        # --no_geo_canonicalize --no_freeze_masks_at_vq, plus
+        # --vq_start_iter 15001 --rate_constrain_iter 20001
+        # --vq_scale_lmbda 32768.
+        self.geo_canonicalize = True
+        self.geo_canon_interval = 100
+        self.geo_canon_aniso_ratio = 1.05
+        self.freeze_masks_at_vq = True
+        # Optional absolute iteration for freezing GS/SH masks. A positive
+        # value takes precedence over freeze_masks_at_vq.
+        self.freeze_masks_iter = -1
+        self.absgs = True
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

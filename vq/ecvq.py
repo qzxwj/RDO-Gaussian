@@ -57,7 +57,9 @@ class ECVQ(nn.Module):
             x_patched = x.split(self.patch_size, dim=0)
             index_cache_patched = index_cache.split(self.patch_size, dim=0) if index_cache is not None else [None] * len(x_patched)
             for patch_idx, b in enumerate(x_patched):
-                x_hat_patched_patch, log2_prob_patch, x_index_patch = self.quant(b, index_cache=index_cache_patched[patch_idx])                    
+                x_hat_patched_patch, log2_prob_patch, x_index_patch = self.quant(
+                    b, index_cache=index_cache_patched[patch_idx]
+                )
                 x_hat.append(x_hat_patched_patch)
                 log2_prob.append(log2_prob_patch)
                 x_index.append(x_index_patch)
@@ -84,17 +86,9 @@ class ECVQ(nn.Module):
             index: (b, cb)
         """
         
-        # quant_start_event = torch.cuda.Event(enable_timing=True)
-        # quant_start_event.record()
-        # torch.cuda.synchronize()  # Wait for the events to be recorded!
-        
         x = rearrange(x, "b (cb cb_dim) -> b cb cb_dim", cb_dim=self.cb_dim)
         codebook = self.codebook
         log2_pmf = Softmax(self.logits).log_pmf() / (-math.log(2))  # cb, cb_size
-        
-        # quant_dist_event = torch.cuda.Event(enable_timing=True)
-        # quant_dist_event.record()
-        # torch.cuda.synchronize()  # Wait for the events to be recorded!
         
         if index_cache is None:
             # l2 distance
@@ -108,25 +102,12 @@ class ECVQ(nn.Module):
             index = dist.argmin(dim=-1, keepdim=True)  # b, cb, 1
         else:
             index = rearrange(index_cache, "b cb -> b cb 1")
-        # one_hot = torch.zeros_like(dist).scatter_(-1, index, 1.0)  # b, cb, cb_size
-        
-        # quant_index_event = torch.cuda.Event(enable_timing=True)
-        # quant_index_event.record()
-        # torch.cuda.synchronize()  # Wait for the events to be recorded!
-        
+            
         x_hat = rearrange(torch.index_select(codebook, 1, index.squeeze()), "cb b cb_dim -> b cb cb_dim")
         log2_prob = rearrange(torch.index_select(log2_pmf, 1, index.squeeze()), "cb b -> b cb")
 
         x_hat = rearrange(x_hat, "b cb cb_dim -> b (cb cb_dim)", cb_dim=self.cb_dim)
         index = rearrange(index, "b cb 1 -> b cb")
-        
-        # quant_end_event = torch.cuda.Event(enable_timing=True)
-        # quant_end_event.record()
-        # torch.cuda.synchronize()  # Wait for the events to be recorded!
-        
-        # print('Quant start time', quant_start_event.elapsed_time(quant_dist_event))
-        # print('Quant dist time', quant_dist_event.elapsed_time(quant_index_event))
-        # print('Quant index time', quant_index_event.elapsed_time(quant_end_event))
         
         return x_hat, log2_prob, index
     
@@ -201,7 +182,7 @@ def get_vq_cfg(opt):
         },
         'cb_lr': opt.vq_cb_lr,
         'logits_lr': opt.vq_logits_lr,
-        'patch_size': opt.vq_patch_size
+        'patch_size': opt.vq_patch_size,
     }
     vq_cfg['keys'] = vq_cfg['lmbda'].keys()
     

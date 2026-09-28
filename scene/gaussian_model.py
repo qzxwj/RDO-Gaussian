@@ -9,9 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.geo_canonicalize import canonicalize_scale_rotation
 from torch import nn
 from torch.optim.lr_scheduler import MultiStepLR
 import os
@@ -55,7 +57,9 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.xyz_gradient_accum_abs = torch.empty(0)
         self.denom = torch.empty(0)
+        self.masks_frozen = False
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -119,28 +123,47 @@ class GaussianModel:
             self._opacity,
             self.max_radii2D,
             self.xyz_gradient_accum,
+            self.xyz_gradient_accum_abs,
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        xyz_gradient_accum_abs = None
+        if len(model_args) == 13:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            xyz_gradient_accum_abs,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+        else:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
         self.sh_mask = nn.Parameter(torch.zeros(self._xyz.shape[0], 3, device="cuda").requires_grad_(True))
         self.gs_mask = nn.Parameter(torch.zeros(self._xyz.shape[0], 1, device="cuda").requires_grad_(True))
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
+        if xyz_gradient_accum_abs is not None:
+            self.xyz_gradient_accum_abs = xyz_gradient_accum_abs
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
@@ -203,6 +226,7 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
@@ -242,6 +266,19 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+
+    def apply_geo_canonicalize(self, aniso_ratio: float = 1.05):
+        scaling_log, rotation, stats = canonicalize_scale_rotation(
+            self._scaling.data, self._rotation.data, aniso_ratio=aniso_ratio
+        )
+        self._scaling.data.copy_(scaling_log)
+        self._rotation.data.copy_(rotation)
+        return stats
+
+    def freeze_prune_masks(self):
+        self.gs_mask.requires_grad_(False)
+        self.sh_mask.requires_grad_(False)
+        self.masks_frozen = True
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -297,6 +334,9 @@ class GaussianModel:
         
         # Rearrange Gaussians by SH masks
         sort_idx, boundaries = shmask_sort(sh_bitmask)
+        sort_idx = spatial_sort_within_boundaries(
+            self._xyz.detach().cpu().numpy(), sort_idx, boundaries
+        )
         sh = -np.ones((num_gaussians, 3), dtype=int)
         sh[sh_bitmask['sh1'], 0] = vq_indexes['sh1'].squeeze()
         sh[sh_bitmask['sh2'], 1] = vq_indexes['sh2'].squeeze()
@@ -313,6 +353,7 @@ class GaussianModel:
                                             sh[boundaries[6]:, 2:]])
         for key in ['scale', 'rot', 'dc']:
             vq_indexes[key] = vq_indexes[key][sort_idx]
+        used_codewords = {k: int(len(np.unique(vq_indexes[k]))) for k in vq_indexes}
         vq_codebooks, vq_logits, vq_indexes = shrink_codebook(vq_codebooks, vq_logits, vq_indexes)
         
         # Non-VQ attributes
@@ -344,9 +385,24 @@ class GaussianModel:
             f.write(boundaries_bitstream)
             f.write(opacity_header_bitstream)
                         
-        np.savez(os.path.join(vq_path, 'codebook.npz'), **vq_codebooks)
-        np.savez(os.path.join(vq_path, 'logits.npz'), **vq_logits)
-        np.savez(os.path.join(vq_path, 'position.npz'), position=xyz)
+        save_npz_lzma(os.path.join(vq_path, 'codebook.npz'), **vq_codebooks)
+        save_npz_lzma(os.path.join(vq_path, 'logits.npz'), **vq_logits)
+        save_positions_lossless(os.path.join(vq_path, 'position.npz'), xyz)
+
+        attr_keys = list(vq_indexes.keys()) + ['opa']
+        file_bytes = {}
+        for fname in ('index_bitstream.bin', 'header.bin', 'codebook.npz', 'logits.npz', 'position.npz'):
+            fpath = os.path.join(vq_path, fname)
+            file_bytes[fname] = int(os.path.getsize(fpath)) if os.path.isfile(fpath) else 0
+        codec_stats = {
+            "num_gaussians": int(num_gaussians),
+            "index_bytes": {k: int(index_lengths[i]) for i, k in enumerate(attr_keys)},
+            "used_codewords": used_codewords,
+            "file_bytes": file_bytes,
+            "total_bytes": int(sum(file_bytes.values())),
+        }
+        with open(os.path.join(vq_path, 'codec_stats.json'), 'w') as f:
+            json.dump(codec_stats, f, indent=2)
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
@@ -373,7 +429,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         
     def decode(self, bitstream_path):
-        xyz = np.load(os.path.join(bitstream_path, 'position.npz'))['position']
+        xyz = load_positions(os.path.join(bitstream_path, 'position.npz'))
         vq_codebooks = np.load(os.path.join(bitstream_path, 'codebook.npz'))
         logits = np.load(os.path.join(bitstream_path, 'logits.npz'))
         boundaries, step_size, min_opacity = decode_header(os.path.join(bitstream_path, 'header.bin'))
@@ -582,6 +638,10 @@ class GaussianModel:
         self.sh_mask = optimizable_tensors["sh_mask"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        if self.xyz_gradient_accum_abs.numel() == valid_points_mask.numel():
+            self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
+        else:
+            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -664,6 +724,7 @@ class GaussianModel:
         self.sh_mask = optimizable_tensors["sh_mask"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -711,12 +772,20 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_gs_mask, new_sh_mask)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, absgs=False):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        split_grads = grads
+        split_tau = max_grad
+        if absgs:
+            grads_abs = self.xyz_gradient_accum_abs / self.denom
+            grads_abs[grads_abs.isnan()] = 0.0
+            ratio = (grads.reshape(-1) >= max_grad).float().mean().clamp(0.0, 0.999)
+            split_tau = torch.quantile(grads_abs.reshape(-1), 1.0 - ratio)
+            split_grads = grads_abs
 
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(split_grads, split_tau, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -728,7 +797,13 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        grad = viewspace_point_tensor.grad[update_filter]
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad[:, :2], dim=-1, keepdim=True)
+        if (
+            self.xyz_gradient_accum_abs.numel() == self.xyz_gradient_accum.numel()
+            and grad.shape[-1] >= 3
+        ):
+            self.xyz_gradient_accum_abs[update_filter] += grad[:, 2:3].abs()
         self.denom[update_filter] += 1
         
     def apply_sh_mask(self):

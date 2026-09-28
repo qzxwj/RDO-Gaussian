@@ -36,8 +36,8 @@ def render(
         activate_vq=False,
         activate_shprune=False,
         activate_gsprune=False,
-        update_index=True
-):
+        update_index=True,
+    ):
     """
     Render the scene.
     Background tensor (bg_color) must be on GPU!
@@ -162,13 +162,17 @@ def render(
             index_cache_dict['sh3'] = index_cache_global_dict['sh3'][sh3_bitmask]
         
         for vq_key in vq_cfg['keys']:
-            result = pc._quantizer[vq_key](vq_inputs[vq_key], index_cache=None if update_index else index_cache_dict[vq_key])
+            result = pc._quantizer[vq_key](
+                vq_inputs[vq_key],
+                index_cache=None if update_index else index_cache_dict[vq_key],
+            )
             vq_out[vq_key] = ste(y_hat=result['x_hat'], y=vq_inputs[vq_key])
             vq_out[vq_key] = pc.vq_post_process(vq_key, vq_out[vq_key])
             bits_dict[vq_key] = result['bits']
             rate_loss.append(bits_dict[vq_key] / vq_cfg['lmbda'][vq_key])
             index_cache_dict[vq_key] = result['x_index']
-            vq_loss.append(torch.sum(torch.norm(result['x_hat'] - vq_inputs[vq_key], dim=-1)))
+            attr_err = torch.norm(result['x_hat'] - vq_inputs[vq_key], dim=-1)
+            vq_loss.append(torch.sum(attr_err))
             vq_dim += vq_inputs[vq_key].shape[-1]
             
         scales[gs_bitmask,:] = vq_out['scale']
@@ -218,5 +222,5 @@ def render(
         "sh_mask_percent": sh_mask_percent,
         "gs_mask_loss": gs_mask_loss,
         "gs_mask_percent": gs_mask_percent,
-        "bits": bits_dict
+        "bits": bits_dict,
     }

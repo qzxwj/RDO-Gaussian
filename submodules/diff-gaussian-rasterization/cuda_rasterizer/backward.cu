@@ -542,8 +542,11 @@ renderCUDA(
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+			const float dL_dmean2D_x = dL_dG * dG_ddelx * ddelx_dx;
+			const float dL_dmean2D_y = dL_dG * dG_ddely * ddely_dy;
+			atomicAdd(&dL_dmean2D[global_id].x, dL_dmean2D_x);
+			atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2D_y);
+			atomicAdd(&dL_dmean2D[global_id].z, hypotf(dL_dmean2D_x, dL_dmean2D_y));
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
